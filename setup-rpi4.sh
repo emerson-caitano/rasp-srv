@@ -1,50 +1,64 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 echo "========================================="
 echo "   SETUP RASPBERRY PI 4 – SERVER MASTER  "
-echo " homeassistant,unifi,uisp,portainer,cockpit"
 echo "========================================="
 
-# Atualização do sistema
-echo "[1/10] Atualizando sistema..."
-sudo apt update && sudo apt upgrade -y
+# 0) exigir execução como root (ou via sudo)
+if [ "$EUID" -ne 0 ]; then
+  echo "Por favor rode o script com sudo: sudo ./setup-rpi4.sh"
+  exit 1
+fi
 
-# --------------------------------------------------------------------
-# Instalar Docker
-# --------------------------------------------------------------------
-echo "[2/10] Instalando Docker..."
+# 1) Atualização do sistema
+echo "[1/12] Atualizando sistema..."
+apt update -y
+apt upgrade -y
+
+# 2) Instalar dependências básicas
+echo "[2/12] Instalando pacotes básicos..."
+apt install -y \
+  ca-certificates curl gnupg lsb-release software-properties-common \
+  apt-transport-https dirmngr git
+
+# 3) Instalar Docker (script oficial)
+echo "[3/12] Instalando Docker..."
 curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
 
-# Habilitar serviço
-sudo systemctl enable docker
-sudo systemctl start docker
+# Garantir que o usuário pi (ou outro) tenha permissão — usamos $SUDO_USER se disponível
+TARGET_USER="${SUDO_USER:-pi}"
+usermod -aG docker "$TARGET_USER" 2>/dev/null || true
 
-# Instalar Docker Compose
-echo "[3/10] Instalando Docker Compose..."
-sudo apt install -y python3-pip
-sudo pip3 install docker-compose
+systemctl enable docker
+systemctl start docker
 
-# Criar pasta de serviços
-echo "[4/10] Criando estrutura de pastas..."
-mkdir -p ~/server-rpi4/{homeassistant,unifi,uisp,portainer,cockpit}
+# 4) Instalar Docker Compose v2 (plugin oficial via apt) - preferível ao pip
+echo "[4/12] Instalando docker compose (plugin)..."
+# Em Debian/Raspberry, o pacote chama docker-compose-plugin - usar apt
+apt update -y
+apt install -y docker-compose-plugin
 
-cd ~/server-rpi4
+# verificar: 'docker compose version'
+echo "[OK] docker compose version:"
+docker compose version || echo "Aviso: docker compose não retornou versão (verifique instalação)."
 
-# --------------------------------------------------------------------
-# Docker Compose – Contêineres do Raspberry Pi 4
-# --------------------------------------------------------------------
-echo "[5/10] Gerando docker-compose.yml..."
+# 5) Instalar Python venv (para pip seguro) caso precise
+echo "[5/12] Instalando python (venv) para ambientes virtuais..."
+apt install -y python3-full python3-venv
 
-cat << 'EOF' > docker-compose.yml
+# 6) Criar estrutura de pastas
+echo "[6/12] Criando estrutura de pastas em /opt/server-rpi4..."
+mkdir -p /opt/server-rpi4/{homeassistant,unifi,uisp,portainer,cockpit}
+chown -R "$TARGET_USER":"$TARGET_USER" /opt/server-rpi4
+cd /opt/server-rpi4
+
+# 7) Gerar docker-compose.yml (ajuste mínimo; confirme imagens ARM quando necessário)
+echo "[7/12] Gerando docker-compose.yml..."
+cat > docker-compose.yml <<'EOF'
 version: "3.9"
-
 services:
 
-  # --------------------------
-  # Home Assistant + HACS
-  # --------------------------
   homeassistant:
     container_name: homeassistant
     image: ghcr.io/home-assistant/home-assistant:stable
@@ -55,9 +69,6 @@ services:
       - ./homeassistant:/config
       - /etc/localtime:/etc/localtime:ro
 
-  # --------------------------
-  # Unifi Network Controller
-  # --------------------------
   unifi:
     container_name: unifi-controller
     image: linuxserver/unifi-controller:latest
@@ -70,9 +81,6 @@ services:
       - PGID=1000
       - TZ=America/Sao_Paulo
 
-  # --------------------------
-  # UISP
-  # --------------------------
   uisp:
     container_name: uisp
     image: ghcr.io/ubiquiti/uisp:latest
@@ -83,9 +91,6 @@ services:
     volumes:
       - ./uisp:/data
 
-  # --------------------------
-  # Portainer
-  # --------------------------
   portainer:
     container_name: portainer
     image: portainer/portainer-ce:latest
@@ -97,48 +102,41 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./portainer:/data
 
-  # --------------------------
-  # Cockpit (somente sistema, fora do Docker)
-  # --------------------------
+# Observação: Cockpit será instalado nativamente (fora do Docker)
 EOF
 
-# --------------------------------------------------------------------
-# Instalar Cockpit nativo (não em container)
-# --------------------------------------------------------------------
-echo "[6/10] Instalando Cockpit..."
-sudo apt install -y cockpit cockpit-pcp
-sudo systemctl enable cockpit
-sudo systemctl start cockpit
+# 8) Instalar Cockpit (nativo)
+echo "[8/12] Instalando Cockpit (nativo)..."
+apt install -y cockpit
+systemctl enable --now cockpit
 
-# --------------------------------------------------------------------
-# Otimizações do sistema
-# --------------------------------------------------------------------
-echo "[7/10] Otimizando consumo de RAM..."
+# 9) Otimizações do sistema (desabilitar serviços desnecessários)
+echo "[9/12] Desabilitando serviços opcionais..."
+systemctl disable triggerhappy.service --now 2>/dev/null || true
+systemctl disable bluetooth.service --now 2>/dev/null || true
+systemctl disable avahi-daemon.service --now 2>/dev/null || true
 
-# Desabilitar serviços desnecessários
-sudo systemctl disable triggerhappy.service --now 2>/dev/null || true
-sudo systemctl disable bluetooth.service --now 2>/dev/null || true
-sudo systemctl disable avahi-daemon.service --now 2>/dev/null || true
+# 10) Ajustar swap para estabilidade (1GB)
+echo "[10/12] Ajustando swap para 1024MB..."
+apt install -y dphys-swapfile
+sed -i 's/^\s*CONF_SWAPSIZE=.*/CONF_SWAPSIZE=1024/' /etc/dphys-swapfile || echo "CONF_SWAPSIZE=1024" >> /etc/dphys-swapfile
+systemctl restart dphys-swapfile
 
-# Ajustar swap para evitar desgaste
-echo "[8/10] Ajustando swap..."
-sudo sed -i 's/CONF_SWAPSIZE=.*/CONF_SWAPSIZE=1024/' /etc/dphys-swapfile
-sudo systemctl restart dphys-swapfile
+# 11) Subir containers com docker compose (plugin)
+echo "[11/12] Subindo containers (docker compose up -d)..."
+# executar como o usuário alvo para criar os volumes com a UID correta
+sudo -u "$TARGET_USER" docker compose up -d
 
-# --------------------------------------------------------------------
-# Finalização
-# --------------------------------------------------------------------
-echo "[9/10] Subindo containers..."
-docker-compose up -d
+# 12) Finalização / instruções
+echo "[12/12] Finalizado! Resumo de acesso:"
+echo " Home Assistant:  http://<IP>:8123  (rodando em network host)"
+echo " Portainer:       http://<IP>:9000"
+echo " Unifi:           https://<IP>:8443  (Unifi usa network host)"
+echo " UISP:            https://<IP>:5443"
+echo " Cockpit:         https://<IP>:9090"
+echo ""
+echo "Recomendo: rebootar o sistema agora: sudo reboot"
+echo "Se precisar instalar pacotes Python, use ambientes virtuais:"
+echo "  python3 -m venv ~/venv && source ~/venv/bin/activate && pip install <pkg>"
 
-echo "[10/10] Finalizado!"
-echo "----------------------------------------"
-echo " ACESSE OS SERVIÇOS:"
-echo " Home Assistant: http://<IP>:8123"
-echo " Portainer:      http://<IP>:9000"
-echo " Unifi:          https://<IP>:8443"
-echo " UISP:           https://<IP>:5443"
-echo " Cockpit:        https://<IP>:9090"
-echo "----------------------------------------"
-echo "REINICIE O RASPBERRY PI PARA FINALIZAR."
-echo "========================================="
+exit 0
