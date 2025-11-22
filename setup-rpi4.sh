@@ -1,83 +1,130 @@
 #!/bin/bash
 
-# =====================
-# Funções de cores
-# =====================
+# ===============================
+#   SCRIPT DE INSTALAÇÃO RPI4
+#   Home Assistant, Unifi, UISP,
+#   Portainer, Cockpit
+# ===============================
+
+# ----- Cores -----
+RED="\e[31m"
 GREEN="\e[32m"
-CYAN="\e[36m"
 YELLOW="\e[33m"
+BLUE="\e[34m"
+CYAN="\e[36m"
 RESET="\e[0m"
 
-header() {
-    echo -e "${CYAN}"
-    echo "==============================================="
-    echo "  $1"
-    echo "==============================================="
-    echo -e "${RESET}"
+banner() {
+    echo -e "${CYAN}\n========================================"
+    echo -e "  $1"
+    echo -e "========================================${RESET}\n"
 }
 
-# =====================
-# INÍCIO DO SCRIPT
-# =====================
+# ----- Verificar root -----
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}Este script deve ser executado como root!${RESET}"
+   exit 1
+fi
 
-header "ATUALIZANDO SISTEMA"
-sudo apt update && sudo apt upgrade -y
+banner "1/10 - Atualizando o sistema"
+apt update && apt upgrade -y
 
-header "INSTALANDO DEPENDÊNCIAS BÁSICAS"
-sudo apt install -y git curl software-properties-common \
-    docker.io docker-compose python3-venv python3-full
+banner "2/10 - Instalando dependências básicas"
+apt install -y curl wget ca-certificates apt-transport-https software-properties-common gnupg lsb-release
 
-header "HABILITANDO DOCKER"
-sudo systemctl enable docker
-sudo systemctl start docker
+banner "3/10 - Instalando Docker"
+curl -fsSL https://get.docker.com | sh
 
-header "INSTALANDO PORTAINER VIA DOCKER"
-sudo docker volume create portainer_data
-sudo docker run -d \
-  -p 9443:9443 \
-  --name portainer \
-  --restart=always \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v portainer_data:/data \
-  portainer/portainer-ce:latest
+banner "4/10 - Habilitando Docker"
+systemctl enable docker
+systemctl start docker
 
-header "INSTALANDO COCKPIT"
-sudo apt install -y cockpit
+banner "5/10 - Instalando Docker Compose"
+curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-aarch64 \
+    -o /usr/local/bin/docker-compose
 
-header "INSTALANDO HOME ASSISTANT (CONTAINER)"
-sudo docker run -d \
-  --name homeassistant \
-  --privileged \
-  --restart=unless-stopped \
-  -e TZ="America/Sao_Paulo" \
-  -v /home/pi/homeassistant:/config \
-  -p 8123:8123 \
-  ghcr.io/home-assistant/home-assistant:stable
+chmod +x /usr/local/bin/docker-compose
+ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose
 
-header "INSTALANDO UNIFI NETWORK CONTROLLER"
-sudo docker run -d \
-  --name unifi \
-  --restart=unless-stopped \
-  -p 8443:8443 \
-  -p 3478:3478/udp \
-  -p 10001:10001/udp \
-  -v /home/pi/unifi:/unifi \
-  jacobalberty/unifi:latest
+banner "6/10 - Criando diretório dos serviços"
+mkdir -p /opt/rpi4-server
+cd /opt/rpi4-server
 
-header "INSTALANDO UISP"
-sudo docker run -d \
-  --name uisp \
-  --restart=unless-stopped \
-  -p 8080:80 \
-  -p 9444:443 \
-  -v /home/pi/uisp:/config \
-  ghcr.io/uisp/uisp:latest
+banner "7/10 - Gerando docker-compose.yml"
 
-header "FINALIZADO! 🎉"
-echo -e "${GREEN}Todos os serviços foram instalados com sucesso no Raspberry Pi 4!${RESET}"
-echo ""
-echo -e "${YELLOW}Portainer:${RESET} https://IP_DO_RPI:9443"
-echo -e "${YELLOW}Home Assistant:${RESET} http://IP_DO_RPI:8123"
-echo -e "${YELLOW}Cockpit:${RESET} http://IP_DO_RPI:9090"
-echo -e "${YELLOW}Unifi Controller:${RESET} https://IP_DO_RPI:8443"
-echo -e "${YELLOW}UISP:${RESET} https://IP_DO_RPI:9444"
+cat << 'EOF' > docker-compose.yml
+services:
+
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: homeassistant
+    network_mode: host
+    privileged: true
+    volumes:
+      - ./homeassistant:/config
+    restart: unless-stopped
+
+  unifi:
+    image: lscr.io/linuxserver/unifi-network-application:latest
+    container_name: unifi
+    networks:
+      - unifi_net
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Sao_Paulo
+    volumes:
+      - ./unifi:/config
+    ports:
+      - 8443:8443
+      - 3478:3478/udp
+      - 10001:10001/udp
+    restart: unless-stopped
+
+  uisp:
+    image: nico640/docker-unms:latest
+    container_name: uisp
+    networks:
+      - unifi_net
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - ./uisp:/data
+    restart: unless-stopped
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    command: -H unix:///var/run/docker.sock
+    ports:
+      - 9000:9000
+      - 9443:9443
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./portainer:/data
+    restart: unless-stopped
+
+networks:
+  unifi_net:
+    driver: bridge
+EOF
+
+banner "8/10 - Ajustando permissões"
+chown -R $SUDO_USER:$SUDO_USER /opt/rpi4-server
+
+banner "9/10 - Subindo containers"
+docker-compose pull
+docker-compose up -d
+
+banner "10/10 - Instalação concluída!"
+echo -e "${GREEN}Todos os serviços foram instalados com sucesso!${RESET}"
+
+echo -e "${YELLOW}
+Acesse:
+- Home Assistant: http://IP_DO_PI:8123
+- Unifi Network: https://IP_DO_PI:8443
+- UISP (UNMS): https://IP_DO_PI/
+- Portainer: https://IP_DO_PI:9443
+${RESET}"
+
